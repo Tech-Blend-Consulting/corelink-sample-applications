@@ -1,0 +1,4 @@
+.env
+customer-app/customer-app
+*.exe
+.DS_Store

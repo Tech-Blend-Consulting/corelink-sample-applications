@@ -1,0 +1,44 @@
+# The CoreLink connector and the Customer Manager sample, side by side.
+#
+#   cp .env.example .env    # then fill it in (see README.md)
+#   docker compose up --build
+#   open http://127.0.0.1:5051
+#
+# The connector holds the dynamic credential as a sealed envelope it cannot
+# open. The app opens it under its own identity's grant and connects to the
+# database with what is inside. Neither container is given a database password.
+
+services:
+  connector:
+    image: ghcr.io/tech-blend-consulting/corelink-connector:${CORELINK_VERSION:-1.28.89}
+    # The identity binding includes the hostname. Docker's default is the
+    # container id, which changes on every recreate and would send the
+    # connector back to the approval queue each time.
+    hostname: corelink-sample-connector
+    restart: unless-stopped
+    environment:
+      PLATFORM_URL: ${PLATFORM_URL:?set PLATFORM_URL in .env}
+      NHI_ID: ${CONNECTOR_NHI_ID:?set CONNECTOR_NHI_ID in .env}
+    tmpfs:
+      - /var/secrets:uid=10001,gid=10001,mode=0700
+    # The app shares this container's network (see below), so its page is
+    # published here. Loopback only: the page names the database user the app
+    # is connected as and has no sign-in of its own.
+    ports:
+      - "127.0.0.1:${APP_PORT:-5051}:5051"
+
+  customer-app:
+    build: ./customer-app
+    restart: unless-stopped
+    # The connector serves envelopes on 127.0.0.1 only, on purpose, so the app
+    # must share its network namespace: the same shape as a sidecar in a pod.
+    network_mode: "service:connector"
+    depends_on:
+      - connector
+    environment:
+      PLATFORM_URL: ${PLATFORM_URL}
+      NHI_ID: ${APP_NHI_ID:?set APP_NHI_ID in .env}
+      SECRET_NAME: ${SECRET_NAME:?set SECRET_NAME in .env}
+      TRANSIT_URL: http://127.0.0.1:9092
+      SAMPLE_BIND_ADDR: 0.0.0.0
+      DB_SSLMODE: ${DB_SSLMODE:-}
