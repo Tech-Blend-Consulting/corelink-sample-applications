@@ -10,7 +10,7 @@
 
 services:
   connector:
-    image: ghcr.io/tech-blend-consulting/corelink-connector:${CORELINK_VERSION:-1.28.89}
+    image: ghcr.io/tech-blend-consulting/corelink-connector:${CORELINK_VERSION:-1.28.104}
     # The identity binding includes the hostname. Docker's default is the
     # container id, which changes on every recreate and would send the
     # connector back to the approval queue each time.
@@ -42,3 +42,4 @@ services:
       TRANSIT_URL: http://127.0.0.1:9092
       SAMPLE_BIND_ADDR: 0.0.0.0
       DB_SSLMODE: ${DB_SSLMODE:-}
+      WATCH_INTERVAL: ${WATCH_INTERVAL:-5s}

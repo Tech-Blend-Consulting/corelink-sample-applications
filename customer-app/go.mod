@@ -5,7 +5,7 @@ go 1.26.0
 toolchain go1.26.10
 
 require (
-	github.com/Tech-Blend-Consulting/corelink-apps/transit v1.28.89
+	github.com/Tech-Blend-Consulting/corelink-apps/transit v1.28.104
 	github.com/jackc/pgx/v5 v5.10.0
 )
 

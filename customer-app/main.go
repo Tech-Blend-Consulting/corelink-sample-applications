@@ -11,6 +11,7 @@
 //	PLATFORM_URL  your CoreLink URL, for the identity's connect (required)
 //	NHI_ID        this application's identity (required unless a deployment file names it)
 //	SECRET_NAME   the dynamic credential's secret name (required unless a deployment file names it)
+//	WATCH_INTERVAL how often to check the credential (default 5s)
 //	TRANSIT_URL   the connector's envelope cache (default http://127.0.0.1:9092)
 //	DB_SSLMODE    override the credential's sslmode (default: the one CoreLink
 //	              issued, else "prefer")
@@ -22,8 +23,10 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -68,6 +71,46 @@ type App struct {
 	transitURL     string
 	secretName     string
 	configSource   string
+
+	// What the live status panel shows, kept by the watcher's callbacks.
+	tc       *transit.Client
+	identity partStatus // this application's identity
+	secret   partStatus // the credential secret
+}
+
+// partStatus is one card of the live status panel.
+type partStatus struct {
+	ID     string    `json:"id,omitempty"`
+	Name   string    `json:"name,omitempty"`
+	State  string    `json:"state"`  // the badge: ok, warn, bad
+	Label  string    `json:"label"`  // what the badge says
+	Detail string    `json:"detail"` // a sentence of explanation
+	Reason string    `json:"reason,omitempty"`
+	Since  time.Time `json:"since"`
+}
+
+// set changes a part's status, keeping since when nothing changed. The
+// caller holds a.mu.
+func (p *partStatus) set(state, label, detail, reason string) {
+	if p.State != state || p.Label != label || p.Reason != reason {
+		p.Since = time.Now()
+	}
+	p.State, p.Label, p.Detail, p.Reason = state, label, detail, reason
+}
+
+// withheldText says, for a person, why CoreLink withholds the secret.
+func withheldText(reason string) (label, detail string) {
+	switch reason {
+	case transit.ReasonSecretDisabled:
+		return "Disabled", "The secret is disabled in CoreLink. Nothing delivers it until it is enabled."
+	case transit.ReasonConnectionLocked:
+		return "Connection locked", "Its database connection is locked in CoreLink. Nothing delivers it until the connection is unlocked."
+	case transit.ReasonIdentityRefused:
+		return "Identity suspended", "CoreLink refuses this application's identity: it is suspended, or no longer verifies."
+	case transit.ReasonConnectorRefused:
+		return "Connector refused", "CoreLink refuses the connector's identity: it is suspended, or no longer verifies."
+	}
+	return "Withheld", "CoreLink is withholding the secret."
 }
 
 func main() {
@@ -123,55 +166,28 @@ func main() {
 	}
 
 	tc := transit.New(opts)
-
-	if err := tc.Bootstrap(); err != nil {
-		log.Fatalf("Transit bootstrap failed: %v", err)
-	}
 	defer tc.Close()
-
-	// Resolve the whole list at startup.
-	//
-	// A name the identity has no grant for, a secret that does not exist, or an
-	// id that does not match the attested identity should fail the pod at deploy
-	// time rather than at three in the morning when a code path runs for the
-	// first time. Resolve checks both halves: that the grants cover the name,
-	// and that a connector actually holds an envelope for it.
-	wanted := []string{secretName}
-	if dep != nil {
-		wanted = dep.Secrets
-	}
-	if err := tc.Resolve(wanted...); err != nil {
-		log.Fatalf("Startup check failed (configured by %s): %v", configSource, err)
-	}
-	log.Printf("Startup check passed: %v", wanted)
 
 	app := &App{
 		transitURL:   transitURL,
 		secretName:   secretName,
 		configSource: configSource,
+		tc:           tc,
 	}
-
-	w := transit.NewWatcher(tc, 15*time.Second)
-
-	// Watch the DB credential secret; reconnect on change.
-	w.WatchSecret(secretName, func(raw string) {
-		app.reloadFromValue(raw)
-	})
-
-	// No config watch. The connector's /v1/configs endpoint answers 410 Gone:
-	// config delivery went the same way as plaintext secret delivery, because it
-	// was the same thing in a different shape -- the connector handing over a
-	// readable value. Watching it here produced a permanent error in the page
-	// rather than a feature, so it is removed rather than left failing.
-	app.configsErr = "config delivery was removed from the connector; secrets arrive as sealed envelopes"
-
-	w.Start()
-	defer w.Close()
+	app.identity.ID = nhiID
+	app.identity.set("warn", "Connecting", "Connecting to CoreLink as this identity.", "")
+	app.secret.Name = secretName
+	app.secret.set("warn", "Waiting", "Not delivered yet.", "")
 
 	http.HandleFunc("/", app.handleIndex)
+	http.HandleFunc("/api/status", app.handleStatus)
 	http.HandleFunc("/customers/add", app.handleAdd)
 	http.HandleFunc("/customers/update", app.handleUpdate)
 	http.HandleFunc("/customers/delete", app.handleDelete)
+
+	// The page comes up first, so what follows can be watched on it: a first
+	// connect that waits for approval, or an identity that is refused.
+	go app.run(tc, dep)
 
 	// Loopback unless told otherwise. This page names the database user the app
 	// is currently connected as, which is the point of the demo and also a thing
@@ -188,6 +204,199 @@ func main() {
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// run connects to CoreLink and watches the credential. A refused or failed
+// connect is retried and shown on the page, not fatal, so a suspended identity
+// or a first connect waiting for approval can be watched as it happens.
+func (a *App) run(tc *transit.Client, dep *transit.Deployment) {
+	for wait := time.Second; ; wait = min(wait*2, 30*time.Second) {
+		err := tc.Bootstrap()
+		if err == nil {
+			break
+		}
+		a.mu.Lock()
+		if errors.Is(err, transit.ErrIdentityRefused) {
+			label, detail := withheldText(transit.ReasonIdentityRefused)
+			a.identity.set("bad", label, detail, transit.ReasonIdentityRefused)
+		} else {
+			a.identity.set("warn", "Connecting", "Could not connect to CoreLink yet: "+err.Error(), "")
+		}
+		a.mu.Unlock()
+		log.Printf("Transit bootstrap failed (%v); retrying in %s", err, wait)
+		time.Sleep(wait)
+	}
+	a.connected()
+
+	// Resolve the whole list at startup.
+	//
+	// A name the identity has no grant for, a secret that does not exist, or an
+	// id that does not match the attested identity is reported now rather than
+	// at three in the morning when a code path runs for the first time. Resolve
+	// checks both halves: that the grants cover the name, and that a connector
+	// actually holds an envelope for it. Shown on the page and logged; the
+	// watcher keeps trying, so a secret that becomes available is picked up.
+	wanted := []string{a.secretName}
+	if dep != nil {
+		wanted = dep.Secrets
+	}
+	if err := tc.Resolve(wanted...); err != nil {
+		log.Printf("Startup check failed (configured by %s): %v", a.configSource, err)
+	} else {
+		log.Printf("Startup check passed: %v", wanted)
+	}
+
+	interval := 5 * time.Second
+	if v, err := time.ParseDuration(os.Getenv("WATCH_INTERVAL")); err == nil && v > 0 {
+		interval = v
+	}
+	w := transit.NewWatcher(tc, interval)
+
+	// Watch the DB credential secret; reconnect on change.
+	w.WatchSecret(a.secretName, func(raw string) {
+		a.reloadFromValue(raw)
+		a.connected()
+		a.mu.Lock()
+		a.secret.set("ok", "Delivered", "Opened from the connector's envelope with the key CoreLink handed this identity.", "")
+		a.mu.Unlock()
+	})
+	// Withheld in CoreLink (disabled, connection locked, identity suspended): stop
+	// using what this process already holds. Nothing delivers it again until
+	// that is undone, when WatchSecret fires again.
+	w.OnUnavailable(func(name string, err error) {
+		a.withdraw(err)
+	})
+	// Every failed fetch, for the status panel.
+	w.OnError(func(name string, err error) {
+		reason := transit.WithheldReason(err)
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		switch {
+		case reason == transit.ReasonIdentityRefused:
+			label, detail := withheldText(reason)
+			a.identity.set("bad", label, detail, reason)
+			a.secret.set("bad", label, detail, reason)
+		case reason != "":
+			label, detail := withheldText(reason)
+			a.secret.set("bad", label, detail, reason)
+		default:
+			a.secret.set("warn", "Unavailable", "Could not fetch it: "+err.Error(), "")
+		}
+	})
+
+	// No config watch. The connector's /v1/configs endpoint answers 410 Gone:
+	// config delivery went the same way as plaintext secret delivery, because it
+	// was the same thing in a different shape -- the connector handing over a
+	// readable value. Watching it here produced a permanent error in the page
+	// rather than a feature, so it is removed rather than left failing.
+	a.mu.Lock()
+	a.configsErr = "config delivery was removed from the connector; secrets arrive as sealed envelopes"
+	a.mu.Unlock()
+
+	w.Start()
+}
+
+// connected records that CoreLink accepts this identity, and learns its name.
+func (a *App) connected() {
+	a.mu.RLock()
+	named := a.identity.Name != ""
+	a.mu.RUnlock()
+	var who transit.Identity
+	if !named {
+		if id, err := a.tc.WhoAmI(); err == nil {
+			who = id
+		}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if who.Name != "" {
+		a.identity.Name = who.Name
+	}
+	a.identity.set("ok", "Connected", "CoreLink accepts this identity.", "")
+}
+
+// connectorStatus is what the connector says about itself on /v1/status.
+type connectorStatus struct {
+	Connector struct {
+		NHIID string `json:"nhi_id"`
+		Name  string `json:"name"`
+	} `json:"connector"`
+	Session       string    `json:"session"`
+	Since         time.Time `json:"since"`
+	Platform      string    `json:"platform"`
+	EnvelopesHeld int       `json:"envelopes_held"`
+}
+
+// connectorPart asks the connector for its status, live.
+func (a *App) connectorPart() map[string]any {
+	out := map[string]any{"url": a.transitURL}
+	client := http.Client{Timeout: time.Second}
+	resp, err := client.Get(strings.TrimSuffix(a.transitURL, "/") + "/v1/status")
+	if err != nil {
+		out["state"], out["label"], out["detail"] = "bad", "Unreachable", "The connector does not answer."
+		return out
+	}
+	defer resp.Body.Close()
+	var st connectorStatus
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&st) != nil {
+		out["state"], out["label"], out["detail"] = "warn", "Unknown", "This connector does not report its status (an older version)."
+		return out
+	}
+	out["id"], out["name"], out["since"], out["envelopes_held"], out["platform"] =
+		st.Connector.NHIID, st.Connector.Name, st.Since, st.EnvelopesHeld, st.Platform
+	switch st.Session {
+	case "connected":
+		out["state"], out["label"], out["detail"] = "ok", "Connected", "Holding sealed envelopes it cannot open."
+	case "refused":
+		label, detail := withheldText(transit.ReasonConnectorRefused)
+		out["state"], out["label"], out["detail"] = "bad", label, detail+" It serves nothing."
+	default:
+		out["state"], out["label"], out["detail"] = "warn", "Connecting", "Connecting to CoreLink."
+	}
+	return out
+}
+
+// databasePart says whether the pool is open and answering.
+func (a *App) databasePart() map[string]any {
+	a.mu.RLock()
+	pool, cred, connErr := a.pool, a.currentCred, a.connError
+	a.mu.RUnlock()
+	out := map[string]any{}
+	if pool == nil {
+		out["state"], out["label"] = "bad", "Disconnected"
+		out["detail"] = "No connection is open."
+		if connErr != "" {
+			out["detail"] = connErr
+		}
+		return out
+	}
+	out["user"], out["target"] = cred.Username, fmt.Sprintf("%s:%s/%s", cred.Host, cred.Port, cred.Database)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := pool.db.PingContext(ctx); err != nil {
+		out["state"], out["label"], out["detail"] = "bad", "Failing", "The database does not accept the connection: "+err.Error()
+		return out
+	}
+	out["state"], out["label"], out["detail"] = "ok", "Connected", "Connected as the dynamic user."
+	return out
+}
+
+// handleStatus serves the live status panel's data. Nothing in it is secret:
+// identity ids are pointers, and the dynamic user's name is shown on the page.
+func (a *App) handleStatus(w http.ResponseWriter, _ *http.Request) {
+	a.mu.RLock()
+	identity, secret := a.identity, a.secret
+	a.mu.RUnlock()
+	body := map[string]any{
+		"identity":  identity,
+		"connector": a.connectorPart(),
+		"secret":    secret,
+		"database":  a.databasePart(),
+		"at":        time.Now().UTC(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 // reloadFromValue parses raw (JSON credential), reconnects to the DB if the
@@ -283,6 +492,21 @@ func sslMode(cred credBundle) string {
 // dsnQuote quotes a value for a libpq key=value connection string.
 func dsnQuote(v string) string {
 	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(v) + "'"
+}
+
+// withdraw drops the database pool and the credential it was opened with.
+func (a *App) withdraw(err error) {
+	a.mu.Lock()
+	if a.pool != nil {
+		a.pool.db.Close()
+		a.pool = nil
+	}
+	a.currentCred = credBundle{}
+	_, why := withheldText(transit.WithheldReason(err))
+	a.connError = "The credential was withdrawn. " + why +
+		" Connections opened with it are closed; it comes back when that is undone."
+	a.mu.Unlock()
+	log.Printf("Credential withdrawn: %v", err)
 }
 
 // --- Domain ---
@@ -464,6 +688,16 @@ func (a *App) peekEnvelope() (id string, version int, cipher string, errMsg stri
 		return "", 0, "", err.Error()
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict {
+		var e struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.NewDecoder(resp.Body).Decode(&e) == nil && e.Error.Message != "" {
+			return "", 0, "", "The connector withholds it: " + e.Error.Message + "."
+		}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", 0, "", fmt.Sprintf("the connector answered HTTP %d", resp.StatusCode)
 	}
@@ -574,6 +808,21 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Inter',system-ui,sans-serif;b
 .cred-bar__val{font-family:var(--mono);font-size:0.82rem;color:var(--text-2)}
 .cred-bar__user{font-family:var(--mono);font-size:0.82rem;color:var(--primary);font-weight:600}
 .cred-bar__item{display:flex;flex-direction:column;gap:0.15rem}
+.status-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1rem;margin-bottom:1.5rem}
+@media(max-width:1100px){.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:600px){.status-grid{grid-template-columns:1fr}}
+.status-card{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--border);border-radius:var(--radius);padding:0.85rem 1rem;display:flex;flex-direction:column;gap:0.3rem;min-width:0}
+.status-card--ok{border-left-color:var(--success)}
+.status-card--warn{border-left-color:var(--warning)}
+.status-card--bad{border-left-color:var(--danger)}
+.status-card__hdr{display:flex;align-items:center;justify-content:space-between;gap:0.5rem}
+.status-card__title{font-size:0.72rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-3)}
+.status-card__main{font-size:0.88rem;color:var(--text);overflow-wrap:anywhere}
+.status-card__sub{font-size:0.75rem;color:var(--text-3);overflow-wrap:anywhere}
+.status-card__detail{font-size:0.8rem;color:var(--text-2)}
+.status-card__since{font-size:0.72rem;color:var(--text-3)}
+.badge--warn{background:var(--warning-bg);color:var(--warning)}
+.mono{font-family:var(--mono)}
 .alert{padding:0.75rem 1rem;border-radius:var(--radius);margin-bottom:1.25rem;font-size:0.875rem}
 .alert--err{background:var(--danger-bg);border:1px solid rgba(239,68,68,0.25);color:var(--danger)}
 .alert--warn{background:var(--warning-bg);border:1px solid rgba(245,158,11,0.2);color:var(--warning)}
@@ -637,46 +886,40 @@ dialog::backdrop{background:rgba(0,0,0,0.55)}
     <h1><span>Customer</span> Manager</h1>
     <div style="display:flex;align-items:center;gap:0.75rem">
       <span class="badge badge--go">Go</span>
-      {{if .ConnError}}
-      <span class="badge badge--err"><span class="dot"></span> Disconnected</span>
-      {{else if .ConnectedAs}}
-      <span class="badge badge--ok"><span class="dot"></span> Connected</span>
-      {{end}}
+      <span class="badge {{if .ConnectedAs}}badge--ok{{else}}badge--err{{end}}" id="hdr-badge"><span class="dot"></span> <span id="hdr-label">{{if .ConnectedAs}}Connected{{else}}Disconnected{{end}}</span></span>
     </div>
   </div>
 
-  <!-- Credential banner -->
-  <div class="cred-bar">
-    <div class="cred-bar__item">
-      <span class="cred-bar__label">Dynamic User</span>
-      {{if .ConnectedAs}}
-      <span class="cred-bar__user">{{.ConnectedAs}}</span>
-      {{else}}
-      <span class="cred-bar__val" style="color:var(--text-3)">not connected</span>
-      {{end}}
+  <!-- Live status: refreshed every 2 seconds from /api/status -->
+  <div class="status-grid" id="status" aria-live="polite">
+    <div class="status-card" id="st-identity">
+      <div class="status-card__hdr"><span class="status-card__title">This app's identity</span><span class="badge st-badge">...</span></div>
+      <div class="status-card__main st-main mono"></div>
+      <div class="status-card__sub st-sub mono"></div>
+      <div class="status-card__detail st-detail"></div>
+      <div class="status-card__since st-since"></div>
     </div>
-    <div class="cred-bar__item">
-      <span class="cred-bar__label">Database</span>
-      <span class="cred-bar__val">{{if .ConnectedTo}}{{.ConnectedTo}}{{else}}--{{end}}</span>
+    <div class="status-card" id="st-connector">
+      <div class="status-card__hdr"><span class="status-card__title">Connector</span><span class="badge st-badge">...</span></div>
+      <div class="status-card__main st-main mono"></div>
+      <div class="status-card__sub st-sub mono"></div>
+      <div class="status-card__detail st-detail"></div>
+      <div class="status-card__since st-since"></div>
     </div>
-    <div class="cred-bar__item">
-      <span class="cred-bar__label">Transit API</span>
-      <span class="cred-bar__val mono">{{.TransitURL}}</span>
+    <div class="status-card" id="st-secret">
+      <div class="status-card__hdr"><span class="status-card__title">Credential secret</span><span class="badge st-badge">...</span></div>
+      <div class="status-card__main st-main mono">{{.SecretName}}</div>
+      <div class="status-card__sub st-sub mono">configured by {{.ConfigSource}}{{if .LastCredChange}} &middot; last rotation {{.LastCredChange}}{{end}}</div>
+      <div class="status-card__detail st-detail"></div>
+      <div class="status-card__since st-since"></div>
     </div>
-    <div class="cred-bar__item">
-      <span class="cred-bar__label">Secret</span>
-      <span class="cred-bar__val mono">{{.SecretName}}</span>
+    <div class="status-card" id="st-database">
+      <div class="status-card__hdr"><span class="status-card__title">Database</span><span class="badge st-badge">...</span></div>
+      <div class="status-card__main st-main mono"></div>
+      <div class="status-card__sub st-sub mono"></div>
+      <div class="status-card__detail st-detail"></div>
+      <div class="status-card__since st-since"></div>
     </div>
-    <div class="cred-bar__item">
-      <span class="cred-bar__label">Configured by</span>
-      <span class="cred-bar__val mono">{{.ConfigSource}}</span>
-    </div>
-    {{if .LastCredChange}}
-    <div class="cred-bar__item">
-      <span class="cred-bar__label">Last Rotation</span>
-      <span class="cred-bar__val">{{.LastCredChange}}</span>
-    </div>
-    {{end}}
   </div>
 
   {{if .ConnError}}
@@ -746,7 +989,7 @@ dialog::backdrop{background:rgba(0,0,0,0.55)}
       </table>
       {{else}}
       <div class="empty">
-        {{if .ConnError}}Could not connect — check transit API{{else}}No customers yet — add one{{end}}
+        {{if .ConnError}}No database connection: the status above says why{{else}}No customers yet — add one{{end}}
       </div>
       {{end}}
     </div>
@@ -886,6 +1129,49 @@ function openEdit(id, name, email, plan) {
   }
   document.getElementById('edit-dialog').showModal();
 }
+
+// Live status: poll /api/status every 2 seconds and update the four cards.
+var lastDB = null;
+function setCard(id, part, main, sub) {
+  var card = document.getElementById(id);
+  if (!card || !part) return;
+  card.className = 'status-card status-card--' + (part.state || 'warn');
+  var badge = card.querySelector('.st-badge');
+  badge.className = 'badge st-badge badge--' + ({ok: 'ok', warn: 'warn', bad: 'err'}[part.state] || 'warn');
+  badge.textContent = part.label || '';
+  if (main !== null) card.querySelector('.st-main').textContent = main;
+  if (sub !== null) card.querySelector('.st-sub').textContent = sub;
+  card.querySelector('.st-detail').textContent = part.detail || '';
+  var since = part.since ? new Date(part.since) : null;
+  card.querySelector('.st-since').textContent =
+    since && since.getFullYear() > 1 ? 'since ' + since.toLocaleTimeString() : '';
+}
+function refreshStatus() {
+  fetch('/api/status', {cache: 'no-store'}).then(function(r) { return r.json(); }).then(function(s) {
+    var id = s.identity || {};
+    setCard('st-identity', id, id.name || id.id || '', id.name ? id.id : '');
+    var c = s.connector || {};
+    setCard('st-connector', c, c.name ? c.name : (c.id || c.url || ''),
+      [c.name ? c.id : '', c.url, c.envelopes_held != null ? c.envelopes_held + ' envelope(s) held' : ''].filter(Boolean).join(' \u00b7 '));
+    setCard('st-secret', s.secret, null, null);
+    var d = s.database || {};
+    setCard('st-database', d, d.user || 'no connection', d.target || '');
+    var hb = document.getElementById('hdr-badge');
+    if (hb) {
+      hb.className = 'badge ' + (d.state === 'ok' ? 'badge--ok' : 'badge--err');
+      document.getElementById('hdr-label').textContent = d.state === 'ok' ? 'Connected' : 'Disconnected';
+    }
+    // When the connection opens or closes, show the customer list as it now is.
+    if (lastDB !== null && lastDB !== d.state && !document.activeElement.closest('form, dialog')) {
+      location.reload();
+    }
+    lastDB = d.state;
+  }).catch(function() {
+    setCard('st-identity', {state: 'bad', label: 'App unreachable', detail: 'The sample app does not answer.'}, null, null);
+  });
+}
+refreshStatus();
+setInterval(refreshStatus, 2000);
 
 // Auto-reload every 15s, but pause while any form field or dialog has focus.
 var reloadTimer = null;

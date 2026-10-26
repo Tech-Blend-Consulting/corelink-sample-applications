@@ -95,6 +95,21 @@ Neither has `secrets:read`, so neither can ask CoreLink for the password on its
 own. The page shows both halves: the ciphertext the connector holds, and the
 database user the app became after opening it.
 
+### The live status panel
+
+The top of the page shows four cards, refreshed every two seconds:
+
+| Card | Shows |
+|---|---|
+| **This app's identity** | its name and id, and whether CoreLink accepts it: Connected, or Identity suspended |
+| **Connector** | which connector it uses (address, identity name and id), its session with CoreLink, and how many envelopes it holds |
+| **Credential secret** | Delivered, or why not: Disabled, Connection locked, Identity suspended, Connector refused |
+| **Database** | the dynamic user it is connected as, live |
+
+When CoreLink withholds the credential the app closes its database connections
+straight away, and the cards say why. When the cause is undone it reconnects by
+itself.
+
 ### What you need
 
 - A CoreLink account with access to **Dynamic Credentials**.
@@ -181,6 +196,17 @@ Then open **http://127.0.0.1:5051**.
 - **Rotation.** Open the credential's secret in CoreLink and press **Rotate
   Now**. Shortly after, the page shows a new dynamic user and a new envelope
   version, and the app keeps working: it reconnected on its own.
+- **Disable.** Disable the secret in CoreLink. Within about five seconds the
+  Credential card says Disabled and the app drops its connection. Enable it and
+  it comes back.
+- **Lock the connection.** On the connection's page, **More > Lock connection**.
+  The Credential card says Connection locked. Unlock it and it comes back.
+- **Suspend the app's identity.** Suspend `customer-app` in CoreLink: the
+  identity card says Identity suspended and every credential is withdrawn.
+  Resume it: it comes back within about 30 seconds (a refused identity is asked
+  again every 30 seconds).
+- **Suspend the connector's identity.** Suspend `customer-app-connector`: the
+  connector drops what it holds and the Connector card says Connector refused.
 - **Revoke.** Revoke the credential in CoreLink. The database user is dropped,
   and nothing can connect as it again.
 - **No grant, no secret.** Remove the app's `unwrap` grant and restart the app.
@@ -194,7 +220,8 @@ Then open **http://127.0.0.1:5051**.
 | `CONNECTOR_NHI_ID` | yes | The connector identity's ID |
 | `APP_NHI_ID` | yes | The application identity's ID |
 | `SECRET_NAME` | yes | The credential's name, exactly as shown in CoreLink |
-| `CORELINK_VERSION` | no | Connector image version (default `1.28.89`) |
+| `CORELINK_VERSION` | no | Connector image version (default `1.28.104`) |
+| `WATCH_INTERVAL` | no | How often the app checks the credential (default `5s`) |
 | `DB_SSLMODE` | no | Overrides the sslmode CoreLink issued (`disable`, `prefer`, `require`, `verify-full`) |
 | `APP_PORT` | no | Local port for the page (default `5051`) |
 
@@ -213,9 +240,8 @@ docker compose logs customer-app
 - **"no secret available to this identity":** the grant's path does not match
   `SECRET_NAME`, or the identity is in a different workspace from the
   credential.
-- **The app keeps restarting after a secret was disabled:** nothing is
-  delivered while a secret is disabled in CoreLink, so the app fails its
-  startup check and Docker restarts it until the secret is enabled again.
+- **A card is red:** it says why. Disabled, Connection locked and the
+  suspended identities are undone in CoreLink; the page recovers by itself.
 - **The database connection times out:** the machine's public IP is not
   allowed in the database firewall.
 - **"permissions would cover no tables" when issuing:** the connection points

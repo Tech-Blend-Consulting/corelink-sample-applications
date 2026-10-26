@@ -1,5 +1,5 @@
-github.com/Tech-Blend-Consulting/corelink-apps/transit v1.28.89 h1:iVH0SGJ3fKBbNRUUDU68yYOLx28Y6Z4EoADdS/dVq3g=
-github.com/Tech-Blend-Consulting/corelink-apps/transit v1.28.89/go.mod h1:r6zehx9uG4sgHRRtr9CULWz35O/rKT2nP9527WKinKA=
+github.com/Tech-Blend-Consulting/corelink-apps/transit v1.28.104 h1:ZVBiYj4fLTcJaWPqV8S/gFXtDxveNgxSjb/Bojyqwmo=
+github.com/Tech-Blend-Consulting/corelink-apps/transit v1.28.104/go.mod h1:r6zehx9uG4sgHRRtr9CULWz35O/rKT2nP9527WKinKA=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
