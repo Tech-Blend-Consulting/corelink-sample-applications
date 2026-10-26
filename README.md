@@ -213,9 +213,9 @@ docker compose logs customer-app
 - **"no secret available to this identity":** the grant's path does not match
   `SECRET_NAME`, or the identity is in a different workspace from the
   credential.
-- **"the secret is disabled":** the credential is disabled in CoreLink.
-  Nothing is delivered while it is, so the app fails its startup check and
-  Docker restarts it until the secret is enabled again.
+- **The app keeps restarting after a secret was disabled:** nothing is
+  delivered while a secret is disabled in CoreLink, so the app fails its
+  startup check and Docker restarts it until the secret is enabled again.
 - **The database connection times out:** the machine's public IP is not
   allowed in the database firewall.
 - **"permissions would cover no tables" when issuing:** the connection points
