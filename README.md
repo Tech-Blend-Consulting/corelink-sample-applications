@@ -11,10 +11,78 @@ configuration, its image or its environment. CoreLink creates a database
 account for it, the app connects with that account, and when the credential
 rotates the app reconnects on the new one without a restart.
 
+### The pieces
+
+```mermaid
+flowchart LR
+    you["You, in the CoreLink console"]
+    corelink["CoreLink<br/>vault, identities, grants"]
+    db[("PostgreSQL<br/>corelink_demo")]
+
+    subgraph machine["Docker on your machine"]
+        subgraph netns["shared network namespace"]
+            connector["Connector<br/>identity granted secrets:cache"]
+            app["Customer Manager<br/>identity granted secrets:unwrap"]
+        end
+    end
+
+    you -- "Step 1: register the database,<br/>issue a credential" --> corelink
+    corelink -- "Step 2: as the admin login:<br/>CREATE ROLE dyn_..., GRANT" --> db
+    connector -- "Step 3: fetch the sealed envelope" --> corelink
+    app -- "Step 4: take the envelope<br/>127.0.0.1:9092" --> connector
+    app -- "Step 5: ask for the key<br/>(grant checked)" --> corelink
+    app == "Step 6: connect as dyn_... over TLS" ==> db
 ```
-  CoreLink  ── sealed envelope ──>  connector  ──(127.0.0.1:9092)──>  Customer Manager  ──>  PostgreSQL
-            <── key, if granted ──────────────────────────────────────┘
+
+The connector holds ciphertext and no key. The app gets the key only for the
+one envelope its grant covers, and opens it in its own memory. The password
+never passes through the connector in a readable form, and it is never written
+to disk, an image or an environment variable.
+
+### What happens, in order
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor you as You
+    participant cl as CoreLink
+    participant db as PostgreSQL
+    participant con as Connector
+    participant app as Customer Manager
+
+    you->>cl: Register the database (admin login kept in the vault)
+    you->>cl: Issue a credential (read_only, named orders-app-db)
+    cl->>db: CREATE ROLE dyn_... and GRANT SELECT, as the admin login
+    cl->>cl: Store the credential sealed, as version 1
+
+    Note over con,app: docker compose up, then approve each identity once in CoreLink
+
+    con->>cl: Connect as the connector identity
+    cl-->>con: Sealed envelope, version 1 (secrets:cache)
+    app->>cl: Connect as the app identity
+    app->>con: Ask for the envelope on 127.0.0.1:9092
+    con-->>app: Envelope, version 1 (ciphertext only)
+    app->>cl: Ask for the key to version 1
+    cl-->>app: Key (secrets:unwrap checked)
+    app->>app: Open the envelope: username, password, host, database
+    app->>db: Connect as dyn_... over TLS
+
+    Note over you,app: Rotation
+    you->>cl: Rotate Now
+    cl->>db: Create a new dyn_ user
+    cl->>cl: Seal it as version 2
+    app->>con: The watcher sees a new version and asks again
+    con-->>app: Envelope, version 2
+    app->>cl: Ask for the key to version 2
+    cl-->>app: Key
+    app->>db: Reconnect as the new user, no restart
+    cl->>db: Drop the old user after the grace period
 ```
+
+The key for version 2 does not open version 1, and the reverse: each envelope
+is bound to its own secret and version, so a replayed old envelope is refused.
+
+### Who is allowed what
 
 Two identities, each allowed one thing:
 
