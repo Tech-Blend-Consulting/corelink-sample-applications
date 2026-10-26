@@ -133,14 +133,31 @@ In CoreLink:
 
 ### 3. Create the two identities
 
-**Identity > NHI > New**, twice, both in the **same workspace** as the
-credential. A tenant-wide identity cannot see any workspace and fetches nothing.
+First switch to the workspace that holds the credential: a new identity is
+created in the workspace you have selected, and one in another workspace (or
+tenant-wide) cannot see the credential and fetches nothing.
 
-- `customer-app-connector`: grant **secrets / cache** with the path set to the
-  credential's name (`orders-app-db`).
-- `customer-app`: grant **secrets / unwrap** with the same path.
+Then **Identity > NHI > New**, twice:
 
-Copy each identity's ID.
+| Field | Connector | Application |
+|---|---|---|
+| Name | `customer-app-connector` | `customer-app` |
+| Identity type | **Service Account** | **Service Account** |
+| External ID | leave empty | leave empty |
+| Owner | yourself | yourself |
+
+Service Account is the type for a process you run yourself. The containers
+prove who they are with a fingerprint of the host they run on, which CoreLink
+checks whatever the type. Workload Identity is for cloud-managed identities and
+is not needed here. Without an owner an identity is listed as orphaned.
+
+On each identity's page, add one grant:
+
+- `customer-app-connector`: **secrets / cache**, path set to the credential's
+  name (`orders-app-db`).
+- `customer-app`: **secrets / unwrap**, same path.
+
+Copy each identity's ID from its page into `.env`.
 
 ### 4. Run it
 
